@@ -8,6 +8,8 @@
 //! - it takes a lot dynamic memory and may not be compatible with the targeted environment;
 //!
 //! This is why all the objects here are marked as deprecated
+//!
+//! Round-trip guarantees are documented on [`Value`].
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -32,6 +34,30 @@ use core::convert::TryFrom;
 /// We advise not to use these objects as an intermediary representation before
 /// retrieving custom types as it is a slow and not memory efficient way to do
 /// so. However it is handy for debugging or reverse a given protocol.
+///
+/// # Round-trip guarantees
+///
+/// `Value` is a tree over CBOR's data model (RFC 8949 §2), not its
+/// encoding: it stores what was decoded, not how it was encoded.
+///
+/// - value -> bytes -> value is the identity at the data-model level:
+///   every value re-decodes bit-exactly (NaN payloads included), map
+///   entries keep wire order and duplicates, and definite/indefinite
+///   arrays and maps are preserved ([`Value::Array`] vs
+///   [`Value::IArray`]). One Rust-side exception: a non-negative
+///   [`Value::I64`] encodes as major type 0 (RFC 8949 §3.1) and so
+///   re-decodes as [`Value::U64`] of the same number.
+/// - bytes -> `Value` -> bytes is not the identity in general: decoding
+///   discards head widths and string chunking, so re-encoding normalizes
+///   the document. Integer, tag and length heads shrink to their
+///   shortest form, floats re-encode as f64 (`0xfb`) whatever width they
+///   arrived at, and indefinite-length byte/text strings collapse into
+///   definite ones. Only input already in that form survives
+///   byte-identically.
+///
+/// For byte-exact re-encoding of arbitrary CBOR use the width-preserving
+/// `_sz` methods on [`Deserializer`](crate::de::Deserializer) and
+/// [`Serializer`](crate::se::Serializer) instead.
 ///
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum Value {

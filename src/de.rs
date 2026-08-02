@@ -44,7 +44,7 @@ fn f16_bits_to_f64(bits: u16) -> f64 {
 
 /// Decode an IEEE 754 binary32 bit pattern to f64. Lossless: NaN payloads
 /// are widened in software (see the NaN arm of [`f16_bits_to_f64`])
-fn f32_bits_to_f64(bits: u32) -> f64 {
+pub(crate) fn f32_bits_to_f64(bits: u32) -> f64 {
     let f = f32::from_bits(bits);
     if f.is_nan() {
         let m = u64::from(bits & 0x007f_ffff) << 29;
@@ -93,13 +93,31 @@ impl Deserialize for bool {
     }
 }
 
+/// Read an `f32` from any float head (`f9`/`fa`/`fb`, RFC 8949 §3.3).
+///
+/// The value must be exactly representable as an f32 (sign, precision,
+/// range and NaN payload included), otherwise this fails with
+/// [`Error::ExpectedF32`] instead of rounding. Like the integer impls,
+/// only the value is checked, never the head width; use
+/// [`Deserializer::float_sz`] to observe the width.
+///
+/// This is CDDL's `float32` as RFC 8610 §3.3 words it, "a number
+/// representable as a single-precision float": CDDL float width types
+/// constrain values, not encodings ("CDDL does not provide any language
+/// means to restrict the choice of serialization variants", §2.2.3).
 impl Deserialize for f32 {
     fn deserialize(raw: &mut Deserializer) -> Result<Self> {
-        #[allow(clippy::cast_possible_truncation)]
-        raw.float().map(|f| f as f32)
+        raw.float()
+            .and_then(|f| crate::se::f64_to_f32_exact(f).ok_or(Error::ExpectedF32))
     }
 }
 
+/// Read an `f64` from any float head (`f9`/`fa`/`fb`, RFC 8949 §3.3).
+///
+/// Always lossless: every half- and single-precision value widens
+/// exactly, NaN payloads included (in software). The head width is
+/// discarded; use [`Deserializer::float_sz`] to observe it. This matches
+/// CDDL's `float` (RFC 8610 §3.3; see the `f32` impl).
 impl Deserialize for f64 {
     fn deserialize(raw: &mut Deserializer) -> Result<Self> {
         raw.float()
@@ -1224,8 +1242,130 @@ mod test {
         assert_matches!(raw.deserialize_complete::<u8>(), Err(Error::TrailingData));
     }
 
-    // manual smoke test for the O(1) advance contract: under the old
-    // drain(..len) implementation this is O(n^2) and takes hours; run with
+    // the integer impls discard the head width, so a value must decode
+    // identically from every width that can carry it, and the range check
+    // must reject from every width too. Exhaustive where the domain is
+    // small (u8/u16), boundary values elsewhere (u32/u64)
+    #[test]
+    fn uint_blanket_impls_width_matrix() {
+        use crate::se::Serializer;
+        fn widths_for(v: u64) -> Vec<Sz> {
+            let mut w = vec![Sz::Eight];
+            if v <= u64::from(u32::MAX) {
+                w.push(Sz::Four);
+            }
+            if v <= u64::from(u16::MAX) {
+                w.push(Sz::Two);
+            }
+            if v <= u64::from(u8::MAX) {
+                w.push(Sz::One);
+            }
+            if v <= 23 {
+                w.push(Sz::Inline);
+            }
+            w
+        }
+        fn encoded(v: u64, sz: Sz) -> Vec<u8> {
+            let mut se = Serializer::new_vec();
+            se.write_unsigned_integer_sz(v, sz).unwrap();
+            se.finalize()
+        }
+
+        // u8: exhaustive acceptance at every carrying width...
+        for v in 0..=u64::from(u8::MAX) {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_eq!(
+                    raw.deserialize::<u8>().unwrap(),
+                    u8::try_from(v).unwrap(),
+                    "v: {} sz: {:?}",
+                    v,
+                    sz
+                );
+            }
+        }
+        // ...and exhaustive rejection over the whole next width class
+        for v in u64::from(u8::MAX) + 1..=u64::from(u16::MAX) {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_matches!(raw.deserialize::<u8>(), Err(Error::ExpectedU8));
+            }
+        }
+
+        // u16: exhaustive acceptance; rejection at and beyond the boundary
+        for v in 0..=u64::from(u16::MAX) {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_eq!(
+                    raw.deserialize::<u16>().unwrap(),
+                    u16::try_from(v).unwrap(),
+                    "v: {} sz: {:?}",
+                    v,
+                    sz
+                );
+            }
+        }
+        for v in [
+            u64::from(u16::MAX) + 1,
+            u64::from(u16::MAX) + 2,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_matches!(raw.deserialize::<u16>(), Err(Error::ExpectedU16));
+            }
+        }
+
+        // u32/u64: the boundary set of every width class, at every width
+        let boundaries = [
+            0,
+            23,
+            24,
+            255,
+            256,
+            u64::from(u16::MAX),
+            u64::from(u16::MAX) + 1,
+            u64::from(u32::MAX),
+        ];
+        for v in boundaries {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_eq!(
+                    raw.deserialize::<u32>().unwrap(),
+                    u32::try_from(v).unwrap(),
+                    "v: {} sz: {:?}",
+                    v,
+                    sz
+                );
+            }
+        }
+        for v in [u64::from(u32::MAX) + 1, u64::MAX - 1, u64::MAX] {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_matches!(raw.deserialize::<u32>(), Err(Error::ExpectedU32));
+            }
+        }
+        for v in boundaries
+            .into_iter()
+            .chain([u64::from(u32::MAX) + 1, u64::MAX])
+        {
+            for sz in widths_for(v) {
+                let mut raw = Deserializer::from(encoded(v, sz));
+                assert_eq!(
+                    raw.deserialize::<u64>().unwrap(),
+                    v,
+                    "v: {} sz: {:?}",
+                    v,
+                    sz
+                );
+            }
+        }
+    }
+
+    // manual smoke test for the O(1) advance contract: an O(len) advance
+    // (e.g. one that drains the consumed prefix) makes this quadratic and
+    // it takes hours instead of seconds; run with
     // `cargo test --release -- --ignored`. Kept out of CI (qemu cross-target
     // jobs make anything wall-clock-sensitive flaky).
     #[test]
@@ -1454,6 +1594,125 @@ mod test {
         assert_eq!(raw.float().unwrap().to_bits(), expected);
     }
 
+    // the `Deserialize` impls accept any float head, like the integer
+    // impls accept any integer head; `f32` fails only when the value
+    // itself has no exact f32 representation
+    #[test]
+    fn float_deserialize_impls_accept_any_head() {
+        // 1.5 at all three widths decodes as both f32 and f64
+        let half: &[u8] = &[0xf9, 0x3e, 0x00];
+        let single: &[u8] = &[0xfa, 0x3f, 0xc0, 0x00, 0x00];
+        let double: &[u8] = &[0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        for bytes in [half, single, double] {
+            let mut raw = Deserializer::from(bytes.to_vec());
+            assert_eq!(raw.deserialize::<f32>().unwrap().to_bits(), 0x3fc0_0000);
+            let mut raw = Deserializer::from(bytes.to_vec());
+            assert_eq!(
+                raw.deserialize::<f64>().unwrap().to_bits(),
+                0x3ff8_0000_0000_0000
+            );
+        }
+
+        // no exact f32 representation: fails instead of rounding to the
+        // nearest f32 (1.1 would come back as bits 0x3f8ccccd)
+        for bytes in [
+            // 1.1: precision loss
+            vec![0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a],
+            // f64::MAX: overflows the f32 range
+            vec![0xfb, 0x7f, 0xef, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            // min f64 subnormal: underflows the f32 range
+            vec![0xfb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ] {
+            let mut raw = Deserializer::from(bytes.clone());
+            assert_matches!(raw.deserialize::<f32>(), Err(Error::ExpectedF32));
+            // ...while all of them are perfectly fine f64s
+            let mut raw = Deserializer::from(bytes.clone());
+            let expected = f64::from_bits(u64::from_be_bytes(bytes[1..].try_into().unwrap()));
+            assert_eq!(raw.deserialize::<f64>().unwrap(), expected);
+        }
+    }
+
+    // NaN payloads narrow in software: a signaling NaN is not quieted, no
+    // payload bit is dropped, and a payload too wide for the 23-bit
+    // mantissa is an error rather than a truncation
+    #[test]
+    fn float_deserialize_impls_handle_nan_payloads_exactly() {
+        for bits in [
+            0x7f80_0001_u32, // sNaN, payload 1
+            0xffc0_0001,     // qNaN, payload 1, negative
+            0x7fc0_0000,     // canonical qNaN
+            0x7fff_ffff,     // all payload bits set
+        ] {
+            let mut bytes = vec![0xfa];
+            bytes.extend_from_slice(&bits.to_be_bytes());
+            let mut raw = Deserializer::from(bytes);
+            assert_eq!(
+                raw.deserialize::<f32>().unwrap().to_bits(),
+                bits,
+                "bits: {:#010x}",
+                bits
+            );
+        }
+        // an `fb`-headed NaN whose payload fits 23 bits narrows exactly...
+        let mut raw = Deserializer::from(vec![0xfb, 0x7f, 0xf0, 0x00, 0x00, 0x20, 0, 0, 0]);
+        assert_eq!(raw.deserialize::<f32>().unwrap().to_bits(), 0x7f80_0001);
+        // ...and one whose payload does not is an error, not a truncation
+        let mut raw = Deserializer::from(vec![0xfb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 1]);
+        assert_matches!(raw.deserialize::<f32>(), Err(Error::ExpectedF32));
+        for bits in [
+            0x7ff0_0000_0000_0001_u64, // sNaN, payload 1
+            0xfff8_0000_0000_0001,     // qNaN, payload 1, negative
+            0x7ff8_0000_0000_0000,     // canonical qNaN
+        ] {
+            let mut bytes = vec![0xfb];
+            bytes.extend_from_slice(&bits.to_be_bytes());
+            let mut raw = Deserializer::from(bytes);
+            assert_eq!(
+                raw.deserialize::<f64>().unwrap().to_bits(),
+                bits,
+                "bits: {:#018x}",
+                bits
+            );
+        }
+    }
+
+    // every rejected input is an `Err`, never a panic: reaching the
+    // assertion at all is the guarantee
+    #[test]
+    fn float_deserialize_impls_reject_without_panicking() {
+        // rejected by both impls: nothing here is a well-formed float
+        for bytes in [
+            vec![],                       // empty
+            vec![0xf5],                   // non-float special
+            vec![0xf6],                   // null
+            vec![0xff],                   // break
+            vec![0xfc],                   // reserved codepoint
+            vec![0xf8, 0x20],             // two-byte simple
+            vec![0x01],                   // wrong major type
+            vec![0x63, 0x61, 0x62, 0x63], // text
+            vec![0xf9, 0x3e],             // truncated `f9`
+            vec![0xfa, 0x00, 0x00],       // truncated `fa`
+            vec![0xfb, 0x00],             // truncated `fb`
+        ] {
+            let mut raw = Deserializer::from(bytes.clone());
+            assert!(raw.deserialize::<f32>().is_err(), "bytes: {:x?}", bytes);
+            let mut raw = Deserializer::from(bytes.clone());
+            assert!(raw.deserialize::<f64>().is_err(), "bytes: {:x?}", bytes);
+        }
+        // while any well-formed float head is fine for both impls (the f32
+        // value here is exactly representable at every width)
+        for bytes in [
+            vec![0xf9, 0x3e, 0x00],
+            vec![0xfa, 0x3f, 0xc0, 0, 0],
+            vec![0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0],
+        ] {
+            let mut raw = Deserializer::from(bytes.clone());
+            assert!(raw.deserialize::<f32>().is_ok(), "bytes: {:x?}", bytes);
+            let mut raw = Deserializer::from(bytes.clone());
+            assert!(raw.deserialize::<f64>().is_ok(), "bytes: {:x?}", bytes);
+        }
+    }
+
     // the byte-level round-trip guarantee: any well-formed f16 encoding
     // (NaN payloads, subnormals, ±0, infinities) decodes and re-encodes
     // to the identical bytes
@@ -1491,6 +1750,43 @@ mod test {
             let mut se = crate::se::Serializer::new_vec();
             se.write_float_sz(f, sz).unwrap();
             assert_eq!(se.finalize(), bytes, "bits: {:#010x}", bits);
+        }
+    }
+
+    // the same 2^32 sweep through the `Serialize`/`Deserialize` impls,
+    // which the `float_sz` sweep above does not exercise: every f32 must
+    // write a lossless head of at most 4 bytes, read back bit-exactly as
+    // f32, and read as f64 equal to its exact widening. Ignored by
+    // default (~2min in release); run with:
+    // cargo test --release float32_exhaustive_blanket -- --ignored
+    #[test]
+    #[ignore]
+    fn float32_exhaustive_blanket_impl_roundtrip() {
+        use crate::se::{Serializer, f32_to_f64_exact};
+        for bits in 0..=u32::MAX {
+            let v = f32::from_bits(bits);
+            let mut se = Serializer::new_vec();
+            se.serialize(&v).unwrap();
+            let bytes = se.finalize();
+            assert!(
+                bytes.len() <= 5,
+                "an f32 never needs the 8-byte head; bits: {:#010x}",
+                bits
+            );
+            let mut raw = Deserializer::from(bytes.clone());
+            assert_eq!(
+                raw.deserialize::<f32>().unwrap().to_bits(),
+                bits,
+                "bits: {:#010x}",
+                bits
+            );
+            let mut raw = Deserializer::from(bytes);
+            assert_eq!(
+                raw.deserialize::<f64>().unwrap().to_bits(),
+                f32_to_f64_exact(v).to_bits(),
+                "bits: {:#010x}",
+                bits
+            );
         }
     }
 

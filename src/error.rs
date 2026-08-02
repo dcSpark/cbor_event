@@ -16,6 +16,19 @@ pub enum Error {
     ExpectedI16,
     ExpectedI32,
     ExpectedI64,
+    /// a float value with no exact f32 representation: sign, precision,
+    /// range and NaN payload must all survive the narrowing. Raised by
+    /// the [`Deserialize`] impl for `f32`, which accepts any float head
+    /// but never rounds; use [`Deserializer::float`] and cast to round
+    /// instead.
+    ///
+    /// The only float variant: decoding into f64 is total (every CBOR
+    /// float value is binary64-representable), and rust has no stable
+    /// `f16` type to have an impl (rust-lang/rust#116909)
+    ///
+    /// [`Deserialize`]: crate::de::Deserialize
+    /// [`Deserializer::float`]: crate::de::Deserializer::float
+    ExpectedF32,
     /// not enough data.
     /// 1st element is the number of bytes available in the current buffer
     /// 2nd element is the total number of bytes needed from the current buffer position.
@@ -47,7 +60,6 @@ pub enum Error {
     /// `Special::Bool`/`Null`/`Undefined` instead) and 24..=31 have no
     /// well-formed encoding at all
     InvalidSimpleValue(u8),
-
     CustomError(String),
 }
 impl From<FromUtf8Error> for Error {
@@ -68,6 +80,10 @@ impl fmt::Display for Error {
             ExpectedI16 => write!(f, "Invalid cbor: expected 16bit long negative integer"),
             ExpectedI32 => write!(f, "Invalid cbor: expected 32bit long negative integer"),
             ExpectedI64 => write!(f, "Invalid cbor: expected 64bit long negative integer"),
+            ExpectedF32 => write!(
+                f,
+                "Invalid cbor: expected a float exactly representable in 32 bits"
+            ),
             NotEnough(got, exp) => write!(
                 f,
                 "Invalid cbor: not enough bytes, expect {} bytes but received {} bytes.",

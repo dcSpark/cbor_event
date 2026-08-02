@@ -63,11 +63,34 @@ fn f64_to_f32_bits_exact(value: f64) -> Option<u32> {
     (f64::from(narrowed).to_bits() == value.to_bits()).then(|| narrowed.to_bits())
 }
 
+/// Exact f64 -> f32 narrowing: `Some` only when every bit of `value`
+/// survives (sign, subnormals and NaN payloads included), so widening the
+/// result back reproduces `value` bit for bit.
+///
+/// In software: an `as` cast rounds silently, and its behaviour on NaN
+/// payloads is unspecified (it can differ by platform, and even between
+/// const-evaluated and runtime casts within one binary).
+#[must_use]
+pub fn f64_to_f32_exact(value: f64) -> Option<f32> {
+    f64_to_f32_bits_exact(value).map(f32::from_bits)
+}
+
+/// Exact f32 -> f64 widening: total, and bit-preserving down to NaN
+/// payloads; [`f64_to_f32_exact`] inverts it exactly.
+///
+/// In software: a hardware `as`/`From` widening may quiet a signaling
+/// NaN or drop its payload, so this is the way to feed an `f32` into
+/// [`Serializer::write_float_sz`] without changing the emitted bytes.
+#[must_use]
+pub fn f32_to_f64_exact(value: f32) -> f64 {
+    crate::de::f32_bits_to_f64(value.to_bits())
+}
+
 /// Smallest CBOR float width that encodes `value` with no loss:
 /// every bit, NaN payloads included, survives
 /// `write_float_sz(value, smallest_float_sz(value))`.
 /// Pair the two for
-/// preferred serialization of floats (RFC 8949 §4.2.1).
+/// preferred serialization of floats (RFC 8949 §4.1).
 ///
 /// Note: a NaN whose payload fits a smaller width shortens to *that
 /// payload*, not to the canonical half-width quiet NaN `0xf9 0x7e00`;
@@ -116,14 +139,24 @@ impl Serialize for bool {
         serializer.write_special(Special::Bool(*self))
     }
 }
+/// Write an `f32` at the smallest width that preserves it bit-exactly,
+/// NaN payload included (RFC 8949 §4.1 preferred serialization, like the
+/// integer impls' canonical heads). Never fails; the widening goes
+/// through [`f32_to_f64_exact`]. Use [`Serializer::write_float_sz`] to
+/// pick the width instead.
 impl Serialize for f32 {
     fn serialize<'a>(&self, serializer: &'a mut Serializer) -> Result<&'a mut Serializer> {
-        serializer.write_special(Special::Float(f64::from(*self)))
+        let widened = f32_to_f64_exact(*self);
+        serializer.write_float_sz(widened, smallest_float_sz(widened))
     }
 }
+/// Write an `f64` at the smallest width that preserves it bit-exactly,
+/// NaN payload included (RFC 8949 §4.1 preferred serialization, like the
+/// integer impls' canonical heads). Never fails. Use
+/// [`Serializer::write_float_sz`] to pick the width instead.
 impl Serialize for f64 {
     fn serialize<'a>(&self, serializer: &'a mut Serializer) -> Result<&'a mut Serializer> {
-        serializer.write_special(Special::Float(*self))
+        serializer.write_float_sz(*self, smallest_float_sz(*self))
     }
 }
 impl Serialize for String {
@@ -788,7 +821,7 @@ impl Serializer {
     }
 
     /// Write a tag that indicates that the following list is a finite
-    /// set. See https://www.iana.org/assignments/cbor-tags/cbor-tags.xhtml.
+    /// set. See <https://www.iana.org/assignments/cbor-tags/cbor-tags.xhtml>.
     pub fn write_set_tag(&mut self) -> Result<&mut Self> {
         self.write_type_definite(Type::Tag, 258, None)
     }
@@ -1330,6 +1363,232 @@ mod test {
             float_sz_bytes(1.5, Sz::One),
             Err(Error::InvalidLenPassed(Sz::One))
         );
+    }
+
+    fn serialized<T: Serialize>(v: &T) -> Vec<u8> {
+        let mut se = Serializer::new_vec();
+        v.serialize(&mut se).unwrap();
+        se.finalize()
+    }
+
+    // the `Serialize` impls write the smallest width that preserves the
+    // value (RFC 8949 §4.1), like the integer impls write canonical
+    // heads; `write_float_sz` is the way to pick a width explicitly
+    #[test]
+    fn float_serialize_impls_use_preferred_serialization() {
+        let f32_cases: &[(f32, &[u8])] = &[
+            (1.5, &[0xf9, 0x3e, 0x00]),
+            // not f16-representable: 24-bit mantissa
+            (1.1, &[0xfa, 0x3f, 0x8c, 0xcc, 0xcd]),
+            (0.0, &[0xf9, 0x00, 0x00]),
+            (-0.0, &[0xf9, 0x80, 0x00]),
+            (f32::INFINITY, &[0xf9, 0x7c, 0x00]),
+            (f32::NEG_INFINITY, &[0xf9, 0xfc, 0x00]),
+            (f32::MAX, &[0xfa, 0x7f, 0x7f, 0xff, 0xff]),
+            // f16::MAX: fits the half-width exactly
+            (65504.0, &[0xf9, 0x7b, 0xff]),
+            // min f32 subnormal: far below the f16 subnormal range
+            (f32::from_bits(1), &[0xfa, 0x00, 0x00, 0x00, 0x01]),
+        ];
+        for (v, expected) in f32_cases {
+            assert_eq!(&serialized(v), expected, "value: {}", v);
+        }
+
+        let f64_cases: &[(f64, &[u8])] = &[
+            (1.5, &[0xf9, 0x3e, 0x00]),
+            (1.1, &[0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a]),
+            (0.0, &[0xf9, 0x00, 0x00]),
+            (-0.0, &[0xf9, 0x80, 0x00]),
+            (f64::INFINITY, &[0xf9, 0x7c, 0x00]),
+            (65504.0, &[0xf9, 0x7b, 0xff]),
+            // f32-exact but not f16-exact: the middle width
+            (f64::from(1.1_f32), &[0xfa, 0x3f, 0x8c, 0xcc, 0xcd]),
+            (
+                f64::MAX,
+                &[0xfb, 0x7f, 0xef, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+        for (v, expected) in f64_cases {
+            assert_eq!(&serialized(v), expected, "value: {}", v);
+        }
+    }
+
+    // NaN payloads shorten to the smallest width the payload fits, and
+    // survive it bit-exactly: the widening/narrowing is done in software,
+    // so a signaling NaN is not quieted and no payload bit is lost
+    #[test]
+    fn float_serialize_impls_preserve_nan_payloads() {
+        let f32_cases: &[(u32, &[u8])] = &[
+            // sNaN payload 1: too wide for f16's 10-bit mantissa
+            (0x7f80_0001, &[0xfa, 0x7f, 0x80, 0x00, 0x01]),
+            (0xffc0_0001, &[0xfa, 0xff, 0xc0, 0x00, 0x01]),
+            // canonical qNaN: payload is the quiet bit alone, fits f16
+            (0x7fc0_0000, &[0xf9, 0x7e, 0x00]),
+            (0x7fff_ffff, &[0xfa, 0x7f, 0xff, 0xff, 0xff]),
+        ];
+        for (bits, expected) in f32_cases {
+            assert_eq!(
+                &serialized(&f32::from_bits(*bits)),
+                expected,
+                "bits: {:#010x}",
+                bits
+            );
+        }
+        let f64_cases: &[(u64, &[u8])] = &[
+            // sNaN payload 1: only f64 can carry it
+            (
+                0x7ff0_0000_0000_0001,
+                &[0xfb, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            ),
+            (
+                0xfff8_0000_0000_0001,
+                &[0xfb, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            ),
+            // canonical qNaN: shortens all the way to `f9 7e00`
+            (0x7ff8_0000_0000_0000, &[0xf9, 0x7e, 0x00]),
+            // payload fits f32's mantissa but not f16's
+            (0x7ff0_0000_2000_0000, &[0xfa, 0x7f, 0x80, 0x00, 0x01]),
+        ];
+        for (bits, expected) in f64_cases {
+            assert_eq!(
+                &serialized(&f64::from_bits(*bits)),
+                expected,
+                "bits: {:#018x}",
+                bits
+            );
+        }
+    }
+
+    // value -> bytes -> value is bit-exact, and the output is a fixpoint:
+    // decoding and re-encoding it reproduces the identical bytes
+    #[test]
+    fn float_blanket_impls_roundtrip_bit_exactly() {
+        for bits in [
+            0x3fc0_0000_u32,
+            0x3f8c_cccd,
+            0x0000_0000,
+            0x8000_0000,
+            0x7f80_0000,
+            0x0000_0001,
+            0x7f80_0001,
+            0xffc0_0001,
+        ] {
+            let v = f32::from_bits(bits);
+            let bytes = serialized(&v);
+            let mut raw = crate::de::Deserializer::from(bytes.clone());
+            assert_eq!(
+                raw.deserialize::<f32>().unwrap().to_bits(),
+                bits,
+                "bits: {:#010x}",
+                bits
+            );
+            let mut raw = crate::de::Deserializer::from(bytes.clone());
+            assert_eq!(serialized(&raw.deserialize::<f32>().unwrap()), bytes);
+        }
+        for bits in [
+            0x3ff8_0000_0000_0000_u64,
+            0x3ff1_9999_9999_999a,
+            0x0000_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0xfff8_0000_0000_0001,
+        ] {
+            let v = f64::from_bits(bits);
+            let bytes = serialized(&v);
+            let mut raw = crate::de::Deserializer::from(bytes.clone());
+            assert_eq!(
+                raw.deserialize::<f64>().unwrap().to_bits(),
+                bits,
+                "bits: {:#018x}",
+                bits
+            );
+            let mut raw = crate::de::Deserializer::from(bytes.clone());
+            assert_eq!(serialized(&raw.deserialize::<f64>().unwrap()), bytes);
+        }
+    }
+
+    // one case per IEEE 754 value class on the exact side and one per
+    // failure mode on the `None` side; the rounds-to-infinity and
+    // rounds-to-zero cases matter because narrowing can change the value
+    // class, not just drop bits. The exhaustive boundary test below
+    // covers the full f32 space
+    #[test]
+    fn f64_to_f32_exact_is_exact_or_none() {
+        for bits in [
+            0x0000_0000_u32, // +0
+            0x8000_0000,     // -0
+            0x0000_0001,     // min subnormal
+            0x007f_ffff,     // max subnormal
+            0x0080_0000,     // min normal
+            0x7f7f_ffff,     // max normal (f32::MAX)
+            0x3fc0_0000,     // 1.5
+            0x7f80_0000,     // +infinity
+            0x7f80_0001,     // sNaN, payload 1
+            0xffff_ffff,     // qNaN, all payload bits set, negative
+        ] {
+            let widened = f32_to_f64_exact(f32::from_bits(bits));
+            assert_eq!(
+                f64_to_f32_exact(widened).map(f32::to_bits),
+                Some(bits),
+                "bits: {:#010x}",
+                bits
+            );
+        }
+        for v in [
+            1.1_f64,                               // nearest f32 is a different number
+            f64::from(f32::MAX) * 2.0,             // finite, but rounds to f32 infinity
+            f64::from(f32::from_bits(1)) / 2.0,    // rounds to zero (ties-to-even)
+            1e300,                                 // exponent far beyond f32 range
+            f64::MIN_POSITIVE,                     // far below the f32 subnormal range
+            f64::from_bits(0x7ff8_0000_0000_0001), // NaN payload wider than 23 bits
+        ] {
+            assert_eq!(f64_to_f32_exact(v), None, "value: {}", v);
+        }
+    }
+
+    // both sides of the f16 exactness boundary: every f64 in binary16's
+    // image narrows back, and every 1-ulp f64 neighbor of an image point
+    // is rejected. Round-trip tests only ever see the accepting side; a
+    // narrowing that rounds instead of checking exactness fails only
+    // here. Image points are 2^42 f64-ulps apart, so a 1-ulp neighbor is
+    // never the image of a different f16
+    #[test]
+    fn f64_to_f16_exhaustive_exactness_boundary() {
+        for bits in 0..=u16::MAX {
+            let mut raw = crate::de::Deserializer::from(vec![0xf9, (bits >> 8) as u8, bits as u8]);
+            let w = raw.float().unwrap();
+            assert_eq!(f64_to_f16_bits_exact(w), Some(bits), "bits: {:#06x}", bits);
+            for nb in [w.to_bits().wrapping_add(1), w.to_bits().wrapping_sub(1)] {
+                assert_eq!(
+                    f64_to_f16_bits_exact(f64::from_bits(nb)),
+                    None,
+                    "1-ulp neighbor of image of {:#06x}",
+                    bits
+                );
+            }
+        }
+    }
+
+    // the same two-sided boundary check over the full 2^32 f32 space
+    // (image points are 2^29 f64-ulps apart). Ignored by default (~1min
+    // in release); run with:
+    // cargo test --release f64_to_f32_exhaustive -- --ignored
+    #[test]
+    #[ignore]
+    fn f64_to_f32_exhaustive_exactness_boundary() {
+        for bits in 0..=u32::MAX {
+            let w = f32_to_f64_exact(f32::from_bits(bits));
+            assert_eq!(f64_to_f32_bits_exact(w), Some(bits), "bits: {:#010x}", bits);
+            for nb in [w.to_bits().wrapping_add(1), w.to_bits().wrapping_sub(1)] {
+                assert_eq!(
+                    f64_to_f32_bits_exact(f64::from_bits(nb)),
+                    None,
+                    "1-ulp neighbor of image of {:#010x}",
+                    bits
+                );
+            }
+        }
     }
 
     #[test]

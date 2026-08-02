@@ -7,6 +7,7 @@
 //! [`Error`]: crate::Error
 //! [`Type`]: crate::Type
 //! [`Special::Float`]: crate::Special::Float
+//! [`Deserializer::float`]: crate::de::Deserializer::float
 //! [`Deserializer::float_sz`]: crate::de::Deserializer::float_sz
 //! [`Serializer::write_float_sz`]: crate::se::Serializer::write_float_sz
 //!
@@ -20,10 +21,48 @@
 //! - Bytes and UTF8 String (of finite and indefinite size);
 //! - Array and Map (of finite and indefinite size);
 //! - Tag;
-//! - Specials (`bool`, `null`, floating points, ...). Floats decode from any
-//!   width (f16/f32/f64); [`Special::Float`] serializes as f64, while the
-//!   width-preserving pair [`Deserializer::float_sz`]/[`Serializer::write_float_sz`]
-//!   round-trips any encoding byte-exactly (NaN payloads included).
+//! - Specials (`bool`, `null`, floating points, ...). The raw float readers
+//!   accept any width (f16/f32/f64): [`Deserializer::float`] discards the
+//!   head width, while the width-preserving pair
+//!   [`Deserializer::float_sz`]/[`Serializer::write_float_sz`] round-trips any
+//!   encoding byte-exactly (NaN payloads included). [`Special::Float`]
+//!   serializes as f64.
+//!
+//!   The [`Deserialize`]/[`Serialize`] impls for `f32`/`f64` follow the
+//!   integer impls: decoding accepts any float head and errors only when
+//!   the value does not fit the type ([`Error::ExpectedF32`] instead of
+//!   rounding), and encoding writes the smallest width that preserves
+//!   the value (RFC 8949 §4.1 preferred serialization). Use the
+//!   width-preserving pair above to pin a width.
+//!
+//! ## Round-trip guarantees
+//!
+//! Round-trip means two different things here:
+//!
+//! - value round-trip (value -> bytes -> value): what was serialized
+//!   re-decodes bit-exactly, NaN payloads, map entry order and duplicate
+//!   keys included. Every layer guarantees this: the typed
+//!   [`Serialize`]/[`Deserialize`] impls, the raw
+//!   [`Serializer`]/[`Deserializer`] methods, and [`Value`].
+//! - byte round-trip (bytes -> decoded form -> bytes): re-encoding
+//!   reproduces the identical bytes for any well-formed input, including
+//!   non-shortest heads and indefinite-length string chunking. Only the
+//!   width-preserving `_sz` pairs guarantee this; every reader has one
+//!   ([`Deserializer::unsigned_integer_sz`], `negative_integer_sz`,
+//!   [`Deserializer::float_sz`], [`Deserializer::bytes_sz`],
+//!   [`Deserializer::text_sz`], `array_sz`, `map_sz`, `tag_sz`, with
+//!   their `Serializer::write_*_sz` counterparts), returning the head
+//!   width (and for strings the chunk structure) alongside the value.
+//!
+//! Everything else normalizes the encoding on re-encode: the typed impls
+//! write preferred serialization (RFC 8949 §4.1) and [`Value`] normalizes
+//! as documented on the type, so non-shortest-form input comes back with
+//! different bytes even though the value is identical.
+//!
+//! [`Deserializer::unsigned_integer_sz`]: crate::de::Deserializer::unsigned_integer_sz
+//! [`Deserializer::bytes_sz`]: crate::de::Deserializer::bytes_sz
+//! [`Deserializer::text_sz`]: crate::de::Deserializer::text_sz
+//! [`Value`]: crate::Value
 //!
 //! ## Raw deserialisation: [`Deserializer`]
 //!
